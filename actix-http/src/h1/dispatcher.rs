@@ -3,12 +3,13 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::{fmt, io, net};
+use std::mem;
 
 use actix_codec::{AsyncRead, AsyncWrite, Decoder, Encoder, Framed, FramedParts};
 use actix_rt::time::{delay_until, Delay, Instant};
 use actix_service::Service;
 use bitflags::bitflags;
-use bytes::{Buf, BytesMut};
+use bytes::{self, Buf, BytesMut, BufMut};
 use log::{error, trace};
 use pin_project::pin_project;
 
@@ -852,6 +853,28 @@ where
     }
 }
 
+/// BufMut impl that does not grow beyond `.capacity()`
+struct MaxBuf<'a>(&'a mut BytesMut);
+
+impl <'a> BufMut for MaxBuf<'a> {
+    #[inline]
+    fn remaining_mut(&self) -> usize {
+        self.0.capacity() - self.0.len()
+    }
+
+    #[inline]
+    unsafe fn advance_mut(&mut self, cnt: usize) {
+        self.0.advance_mut(cnt)
+    }
+
+    #[inline]
+    fn bytes_mut(&mut self) -> &mut [mem::MaybeUninit<u8>] {
+        let remaining = self.remaining_mut();
+        // Unlike the normal trait impl set the upper bound on the slice to the remaining
+        &mut BufMut::bytes_mut(self.0)[..remaining]
+    }
+}
+
 fn read_available<T>(
     cx: &mut Context<'_>,
     io: &mut T,
@@ -861,13 +884,21 @@ where
     T: AsyncRead + Unpin,
 {
     let mut read_some = false;
+
     loop {
         let remaining = buf.capacity() - buf.len();
+
+        // If buf is full return but do not disconnect since
+        // there is more reading to be done
+        if buf.len() >= HW_BUFFER_SIZE {
+            return Ok(Some(false));
+        }
+
         if remaining < LW_BUFFER_SIZE {
             buf.reserve(HW_BUFFER_SIZE - remaining);
         }
 
-        match read(cx, io, buf) {
+        match read(cx, io, &mut MaxBuf(buf)) {
             Poll::Pending => {
                 return if read_some { Ok(Some(false)) } else { Ok(None) };
             }
@@ -895,10 +926,10 @@ where
     }
 }
 
-fn read<T>(
+fn read<'a, T>(
     cx: &mut Context<'_>,
     io: &mut T,
-    buf: &mut BytesMut,
+    buf: &'a mut MaxBuf<'a>,
 ) -> Poll<Result<usize, io::Error>>
 where
     T: AsyncRead + Unpin,
